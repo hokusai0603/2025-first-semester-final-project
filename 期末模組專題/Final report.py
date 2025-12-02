@@ -13,17 +13,254 @@ AI 金融交易系統 - 針對 2020-2024 台股市場
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
 import joblib
 import warnings
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
 warnings.filterwarnings('ignore')
 
 # ==================== 第一部分：技術指標計算 ====================
+
+# ==================== 新增：度量學習（原型網路）模型 ====================
+
+class ProtoEncoder(nn.Module):
+    def __init__(self, input_dim: int, embedding_dim: int = 16, hidden_dims=(64, 32), dropout: float = 0.1):
+        super().__init__()
+        layers = []
+        last = input_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(last, h), nn.ReLU()]
+            if dropout > 0:
+                layers += [nn.Dropout(dropout)]
+            last = h
+        layers += [nn.Linear(last, embedding_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ProtoNet:
+    """簡化版 Prototypical Networks for tabular classification.
+    - 使用 MLP 取得 embedding
+    - episodic 訓練：每回合對每一類抽 K 支持與 Q 查詢，最小化查詢到各原型距離的交叉熵
+    - 推論：以全訓練集嵌入的類別平均向量作為原型，取最近原型
+    """
+
+    def __init__(self,
+                 input_dim: int,
+                 n_classes: int,
+                 embedding_dim: int = 16,
+                 hidden_dims=(64, 32),
+                 dropout: float = 0.1,
+                 lr: float = 1e-3,
+                 epochs: int = 40,
+                 episodes_per_epoch: int = 60,
+                 K: int = 5,
+                 Q: int = 10,
+                 temperature: float = 1.0,
+                 device: str = 'cpu'):
+        self.input_dim = input_dim
+        self.n_classes = n_classes
+        self.embedding_dim = embedding_dim
+        self.hidden_dims = hidden_dims
+        self.dropout = dropout
+        self.lr = lr
+        self.epochs = epochs
+        self.episodes_per_epoch = episodes_per_epoch
+        self.K = K
+        self.Q = Q
+        self.temperature = temperature
+        self.device = torch.device(device)
+
+        self.encoder = ProtoEncoder(input_dim, embedding_dim, hidden_dims, dropout).to(self.device)
+        self.scaler = StandardScaler()
+        self.class_to_index = None
+        self.index_to_class = None
+        self.prototypes = None  # shape: (n_classes, embedding_dim)
+
+    def _to_tensor(self, x_np):
+        return torch.tensor(x_np, dtype=torch.float32, device=self.device)
+
+    def _compute_prototypes(self, emb: torch.Tensor, y_idx: np.ndarray) -> torch.Tensor:
+        # emb: (N, D), y_idx: (N,)
+        protos = []
+        for c in range(self.n_classes):
+            m = (y_idx == c)
+            if m.sum() == 0:
+                # 若某類別沒有樣本，設為零向量
+                protos.append(torch.zeros(emb.shape[1], device=self.device))
+            else:
+                protos.append(emb[m].mean(dim=0))
+        return torch.stack(protos, dim=0)  # (C, D)
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        # 建立標籤索引映射
+        classes = np.sort(np.unique(y))
+        self.class_to_index = {c: i for i, c in enumerate(classes)}
+        self.index_to_class = {i: c for c, i in self.class_to_index.items()}
+        y_idx = np.vectorize(self.class_to_index.get)(y)
+
+        # 標準化特徵
+        X_scaled = self.scaler.fit_transform(X)
+        X_tensor = self._to_tensor(X_scaled)
+
+        optimizer = optim.Adam(self.encoder.parameters(), lr=self.lr)
+
+        rng = np.random.default_rng(42)
+        # 為每一類建立索引集合
+        idx_by_class = {c: np.where(y_idx == c)[0] for c in range(self.n_classes)}
+
+        # 訓練（簡化 episodic）
+        self.encoder.train()
+        for epoch in range(self.epochs):
+            total_loss = 0.0
+            episodes = 0
+            for _ in range(self.episodes_per_epoch):
+                support_idx = []
+                query_idx = []
+                valid = True
+                for c in range(self.n_classes):
+                    idxs = idx_by_class[c]
+                    if len(idxs) == 0:
+                        valid = False
+                        break
+                    # 若數量不足，允許重複抽樣
+                    s = rng.choice(idxs, size=self.K, replace=(len(idxs) < self.K))
+                    q = rng.choice(idxs, size=self.Q, replace=(len(idxs) < self.Q))
+                    support_idx.append(s)
+                    query_idx.append(q)
+                if not valid:
+                    continue
+
+                support_idx = np.concatenate(support_idx)
+                query_idx = np.concatenate(query_idx)
+
+                X_sup = X_tensor[support_idx]
+                X_que = X_tensor[query_idx]
+                y_que = y_idx[query_idx]
+
+                # 取得嵌入與原型
+                z_sup = self.encoder(X_sup)  # (C*K, D)
+                z_que = self.encoder(X_que)  # (C*Q, D)
+
+                # 計算每類的原型（support 平均）
+                # 將 support 拆回各類別切塊
+                z_chunks = torch.chunk(z_sup, self.n_classes, dim=0)
+                protos = torch.stack([zc.mean(dim=0) for zc in z_chunks], dim=0)  # (C, D)
+
+                # 距離 -> logits
+                # z_que: (Nq, D), protos: (C, D)
+                # pairwise distances
+                dists = torch.cdist(z_que, protos, p=2)  # (Nq, C)
+                logits = - (dists ** 2) / self.temperature
+                loss = F.cross_entropy(logits, torch.tensor(y_que, device=self.device))
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                episodes += 1
+
+            if episodes > 0 and (epoch + 1) % 5 == 0:
+                avg_loss = total_loss / episodes
+                print(f"ProtoNet 訓練 Epoch {epoch+1}/{self.epochs} - 平均損失: {avg_loss:.4f}")
+
+        # 以所有訓練樣本建立最終原型
+        self.encoder.eval()
+        with torch.no_grad():
+            z_all = self.encoder(X_tensor)
+            protos = self._compute_prototypes(z_all, y_idx)
+        self.prototypes = protos.detach().cpu().numpy()
+        return self
+
+    def _embed(self, X: np.ndarray) -> np.ndarray:
+        self.encoder.eval()
+        X_scaled = self.scaler.transform(X)
+        with torch.no_grad():
+            z = self.encoder(self._to_tensor(X_scaled))
+        return z.detach().cpu().numpy()
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        Z = self._embed(X)  # (N, D)
+        # 距離到原型
+        dists = ((Z[:, None, :] - self.prototypes[None, :, :]) ** 2).sum(axis=2)  # (N, C)
+        idx = dists.argmin(axis=1)
+        # 映回原始標籤
+        return np.vectorize(self.index_to_class.get)(idx)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        Z = self._embed(X)
+        dists = ((Z[:, None, :] - self.prototypes[None, :, :]) ** 2).sum(axis=2)
+        logits = - dists / self.temperature
+        # softmax
+        e = np.exp(logits - logits.max(axis=1, keepdims=True))
+        p = e / e.sum(axis=1, keepdims=True)
+        # 需對應原始類別順序（0,1,2）
+        # self.index_to_class: idx -> class_label
+        order = [self.class_to_index[c] for c in sorted(self.class_to_index.keys())]
+        return p[:, order]
+
+    # 用於持久化
+    def get_state(self):
+        return {
+            'model_type': 'prototypical',
+            'input_dim': self.input_dim,
+            'n_classes': self.n_classes,
+            'embedding_dim': self.embedding_dim,
+            'hidden_dims': self.hidden_dims,
+            'dropout': self.dropout,
+            'lr': self.lr,
+            'epochs': self.epochs,
+            'episodes_per_epoch': self.episodes_per_epoch,
+            'K': self.K,
+            'Q': self.Q,
+            'temperature': self.temperature,
+            'state_dict': {k: v.cpu().numpy() for k, v in self.encoder.state_dict().items()},
+            'prototypes': self.prototypes,
+            'scaler_mean_': self.scaler.mean_.copy(),
+            'scaler_scale_': self.scaler.scale_.copy(),
+            'class_to_index': self.class_to_index,
+            'index_to_class': self.index_to_class,
+        }
+
+    @staticmethod
+    def from_state(state: dict):
+        model = ProtoNet(
+            input_dim=state['input_dim'],
+            n_classes=state['n_classes'],
+            embedding_dim=state['embedding_dim'],
+            hidden_dims=tuple(state['hidden_dims']),
+            dropout=state['dropout'],
+            lr=state['lr'],
+            epochs=state['epochs'],
+            episodes_per_epoch=state['episodes_per_epoch'],
+            K=state['K'],
+            Q=state['Q'],
+            temperature=state['temperature'],
+            device='cpu'
+        )
+        # 還原 encoder 權重
+        sd = {k: torch.tensor(v) for k, v in state['state_dict'].items()}
+        model.encoder.load_state_dict(sd)
+        # 還原 scaler
+        model.scaler.mean_ = np.array(state['scaler_mean_'])
+        model.scaler.scale_ = np.array(state['scaler_scale_'])
+        model.scaler.n_features_in_ = model.input_dim
+        # 還原原型與索引映射
+        model.prototypes = np.array(state['prototypes'])
+        model.class_to_index = state['class_to_index']
+        model.index_to_class = state['index_to_class']
+        return model
 
 def calculate_rsi(data, period=14):
     """
@@ -196,27 +433,18 @@ def download_stock_data(stock_id, start_date='2020-01-01', end_date='2024-12-31'
 # ==================== 第四部分：模型訓練 ====================
 
 class StockTradingModel:
-    """股票交易預測模型類別"""
+    """股票交易預測模型類別（已改為度量學習：原型網路）"""
     
     def __init__(self, stock_id, feature_cols=None, use_few_shot=True):
         self.stock_id = stock_id
-        self.use_few_shot = use_few_shot  # 是否使用 Few-Shot Learning
-        self.model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=10,
-            min_samples_split=20,
-            min_samples_leaf=10,
-            random_state=42,
-            n_jobs=-1,
-            class_weight='balanced'  # 自動處理類別不平衡
-        )
+        self.use_few_shot = use_few_shot  # 是否使用 Few-Shot Learning（透過 episodic 訓練達成）
+        self.model = None  # 將在 train() 中建立 ProtoNet
         self.feature_cols = feature_cols or [
             'RSI', 'SMA_Deviation', 'ATR_Normalized',
             'LogReturn_5', 'LogReturn_10', 'LogReturn_20',
             'Volume_Change', 'Momentum_10', 'Momentum_20'
         ]
-        self.scaler = None
-        self.few_shot_samples = {}  # 儲存 Few-Shot 樣本
+        self.few_shot_samples = {}
         
     def prepare_data(self, data, train_end='2023-12-31'):
         """
@@ -359,44 +587,42 @@ class StockTradingModel:
         return X_final, y_final
     
     def train(self, X_train, y_train):
-        """訓練模型（支援 Few-Shot Learning）"""
+        """訓練模型（使用 Prototypical Network）"""
         print(f"\n開始訓練 {self.stock_id} 的模型...")
-        
+
+        # 印出類別分布（觀察不平衡情況）
+        class_counts = pd.Series(y_train).value_counts()
+        print("\n類別分布：")
+        for class_label in sorted(class_counts.index):
+            count = class_counts[class_label]
+            percentage = count / len(y_train) * 100
+            class_name = ['賣出/觀望', '持有', '買入'][int(class_label)]
+            print(f"  {class_name} (類別{int(class_label)}): {count:>4} 筆 ({percentage:>5.2f}%)")
+
+        X_np = X_train.values if isinstance(X_train, pd.DataFrame) else np.asarray(X_train)
+        y_np = y_train.values if isinstance(y_train, (pd.Series, pd.DataFrame)) else np.asarray(y_train)
+
+        # 若啟用 few-shot，使用較小 K 並提高 episodes 以強化小樣本學習
         if self.use_few_shot:
-            print("\n=== Few-Shot Learning 模式 ===")
-            
-            # 1. 計算樣本權重
-            sample_weights = self.calculate_sample_weights(y_train)
-            
-            # 2. 數據增強
-            print("\n執行數據增強...")
-            X_train_aug, y_train_aug = self.augment_minority_samples(X_train, y_train)
-            print(f"增強後訓練集大小：{len(X_train_aug)} 筆 (原始: {len(X_train)} 筆)")
-            
-            # 3. 使用增強後的數據和樣本權重訓練
-            # 重新計算增強後數據的權重
-            sample_weights_aug = self.calculate_sample_weights(y_train_aug)
-            print("\n使用樣本權重訓練模型...")
-            self.model.fit(X_train_aug, y_train_aug, sample_weight=sample_weights_aug)
+            K, Q, episodes = 5, 10, 80
         else:
-            print("\n=== 標準訓練模式 ===")
-            self.model.fit(X_train, y_train)
-        
-        # 顯示特徵重要性
-        feature_importance = pd.DataFrame({
-            'Feature': self.feature_cols,
-            'Importance': self.model.feature_importances_
-        }).sort_values('Importance', ascending=False)
-        
-        print("\n特徵重要性 (前5名):")
-        print(feature_importance.head())
-        
+            K, Q, episodes = 5, 10, 40
+
+        proto = ProtoNet(
+            input_dim=X_np.shape[1], n_classes=3,
+            embedding_dim=16, hidden_dims=(64, 32), dropout=0.1,
+            lr=1e-3, epochs=40, episodes_per_epoch=episodes,
+            K=K, Q=Q, temperature=1.0, device='cpu'
+        )
+        proto.fit(X_np, y_np)
+        self.model = proto
         return self.model
     
     def evaluate(self, X_test, y_test):
         """評估模型"""
-        y_pred = self.model.predict(X_test)
-        y_pred_proba = self.model.predict_proba(X_test)[:, 1]
+        X_np = X_test.values if isinstance(X_test, pd.DataFrame) else np.asarray(X_test)
+        y_pred = self.model.predict(X_np)
+        y_pred_proba = self.model.predict_proba(X_np)
         
         accuracy = accuracy_score(y_test, y_pred)
         
@@ -411,33 +637,48 @@ class StockTradingModel:
         return y_pred, y_pred_proba, accuracy
     
     def save_model(self, filepath):
-        """儲存模型"""
-        # 確保使用腳本所在目錄的絕對路徑
+        """儲存模型（支援 Prototypical Network 持久化）"""
         script_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(script_dir, filepath)
-        
-        model_data = {
-            'model': self.model,
-            'feature_cols': self.feature_cols,
-            'stock_id': self.stock_id
-        }
+
+        # 若為 ProtoNet，保存其 state；否則嘗試直接保存（相容舊版）
+        if isinstance(self.model, ProtoNet):
+            model_state = self.model.get_state()
+            model_data = {
+                'model_type': 'prototypical',
+                'model_state': model_state,
+                'feature_cols': self.feature_cols,
+                'stock_id': self.stock_id
+            }
+        else:
+            model_data = {
+                'model_type': 'legacy',
+                'model': self.model,
+                'feature_cols': self.feature_cols,
+                'stock_id': self.stock_id
+            }
         joblib.dump(model_data, full_path)
         print(f"\n模型已儲存至: {full_path}")
     
     @staticmethod
     def load_model(filepath):
-        """載入模型"""
-        # 如果是相對路徑，轉換為腳本目錄的絕對路徑
+        """載入模型（支援 ProtoNet）"""
         if not os.path.isabs(filepath):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             filepath = os.path.join(script_dir, filepath)
-        
+
         model_data = joblib.load(filepath)
         stock_model = StockTradingModel(
             stock_id=model_data['stock_id'],
             feature_cols=model_data['feature_cols']
         )
-        stock_model.model = model_data['model']
+
+        if model_data.get('model_type') == 'prototypical':
+            state = model_data['model_state']
+            stock_model.model = ProtoNet.from_state(state)
+        else:
+            stock_model.model = model_data.get('model')
+
         print(f"模型已載入: {filepath}")
         return stock_model
 
