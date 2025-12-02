@@ -1,5 +1,5 @@
 """
-AI 金融交易系統 - 針對 2022-2024 台股市場
+AI 金融交易系統 - 針對 2020-2024 台股市場
 目標：使用機器學習模型預測股票走勢，並與 0050 進行比較
 
 選定標的：
@@ -138,23 +138,33 @@ def engineer_features(data):
     return df
 
 
-def create_labels(data, threshold=0.002):
+def create_labels(data, threshold=0.004, hold_threshold=0.002):
     """
-    建立預測標籤：預測明日收盤價是否高於明日開盤價
-    考慮交易成本，設定門檻為 0.2% (降低門檻以增加機會)
+    建立預測標籤：預測明日的操作策略（三分類）
+    考慮交易成本，設定門檻為 0.4% (手續費0.1425% + 證交稅0.3%)
     
     Args:
         data: DataFrame
-        threshold: 獲利門檻 (預設 0.2%)
+        threshold: 買入門檻 (預設 0.4%)
+        hold_threshold: 持有門檻 (預設 0.2%)
     
     Returns:
-        Series: 標籤 (1=看漲買入, 0=看跌觀望)
+        Series: 標籤 (0=賣出/觀望, 1=持有, 2=買入)
     """
     future_close = data['Close'].shift(-1)
     future_open = data['Open'].shift(-1)
     
-    # 只有當預期收益超過交易成本時才標記為 1
-    labels = (future_close > future_open * (1 + threshold)).astype(int)
+    # 計算預期收益率
+    expected_return = (future_close - future_open) / future_open
+    
+    # 三分類標籤
+    # 2: 預期收益 > threshold (買入)
+    # 1: -hold_threshold <= 預期收益 <= threshold (持有)
+    # 0: 預期收益 < -hold_threshold (賣出/觀望)
+    labels = pd.Series(1, index=data.index)  # 預設為持有
+    labels[expected_return > threshold] = 2  # 買入
+    labels[expected_return < -hold_threshold] = 0  # 賣出/觀望
+    
     return labels
 
 
@@ -188,16 +198,17 @@ def download_stock_data(stock_id, start_date='2020-01-01', end_date='2024-12-31'
 class StockTradingModel:
     """股票交易預測模型類別"""
     
-    def __init__(self, stock_id, feature_cols=None):
+    def __init__(self, stock_id, feature_cols=None, use_few_shot=True):
         self.stock_id = stock_id
+        self.use_few_shot = use_few_shot  # 是否使用 Few-Shot Learning
         self.model = RandomForestClassifier(
             n_estimators=200,
-            max_depth=15,              # 原：10 → 增加深度
-            min_samples_split=10,      # 原：20 → 降低限制
-            min_samples_leaf=5,        # 原：10 → 降低限制
-            class_weight='balanced',   # ★ 新增：解決類別不平衡
+            max_depth=10,
+            min_samples_split=20,
+            min_samples_leaf=10,
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
+            class_weight='balanced'  # 自動處理類別不平衡
         )
         self.feature_cols = feature_cols or [
             'RSI', 'SMA_Deviation', 'ATR_Normalized',
@@ -205,6 +216,7 @@ class StockTradingModel:
             'Volume_Change', 'Momentum_10', 'Momentum_20'
         ]
         self.scaler = None
+        self.few_shot_samples = {}  # 儲存 Few-Shot 樣本
         
     def prepare_data(self, data, train_end='2023-12-31'):
         """
@@ -220,8 +232,8 @@ class StockTradingModel:
         # 建立特徵
         df = engineer_features(data)
         
-        # 建立標籤 (使用降低後的門檻)
-        df['Target'] = create_labels(df, threshold=0.002)
+        # 建立標籤（三分類：0=賣出/觀望, 1=持有, 2=買入）
+        df['Target'] = create_labels(df, threshold=0.004, hold_threshold=0.002)
         
         # 移除 NaN
         df = df.dropna()
@@ -242,10 +254,133 @@ class StockTradingModel:
         
         return X_train, X_test, y_train, y_test, train_data, test_data
     
+    def calculate_sample_weights(self, y_train):
+        """
+        計算 Few-Shot Learning 的樣本權重
+        對於少數類別的樣本給予更高的權重
+        
+        Args:
+            y_train: 訓練標籤
+        
+        Returns:
+            array: 樣本權重
+        """
+        from sklearn.utils.class_weight import compute_sample_weight
+        
+        # 計算類別分布
+        class_counts = pd.Series(y_train).value_counts()
+        print(f"\n類別分布：")
+        for class_label in sorted(class_counts.index):
+            count = class_counts[class_label]
+            percentage = count / len(y_train) * 100
+            class_name = ['賣出/觀望', '持有', '買入'][int(class_label)]
+            print(f"  {class_name} (類別{int(class_label)}): {count:>4} 筆 ({percentage:>5.2f}%)")
+        
+        # 使用 sklearn 計算平衡權重
+        sample_weights = compute_sample_weight('balanced', y_train)
+        
+        # Few-Shot 增強：對最少數類別額外增加權重
+        min_class = class_counts.idxmin()
+        min_count = class_counts.min()
+        max_count = class_counts.max()
+        
+        if min_count < max_count * 0.3:  # 如果最少類別樣本數 < 最多類別的30%
+            boost_factor = 1.5  # 額外增強係數
+            for i, label in enumerate(y_train):
+                if label == min_class:
+                    sample_weights[i] *= boost_factor
+            print(f"\n套用 Few-Shot Learning：對 '{['賣出/觀望', '持有', '買入'][int(min_class)]}' 類別樣本權重提升 {boost_factor}x")
+        
+        return sample_weights
+    
+    def augment_minority_samples(self, X_train, y_train, augment_ratio=0.5):
+        """
+        數據增強：為少數類別生成合成樣本 (SMOTE-like)
+        
+        Args:
+            X_train: 訓練特徵
+            y_train: 訓練標籤
+            augment_ratio: 增強比例
+        
+        Returns:
+            tuple: (增強後的X, 增強後的y)
+        """
+        from sklearn.utils import resample
+        
+        # 轉換為 numpy array 確保一致性
+        if isinstance(X_train, pd.DataFrame):
+            X_train_array = X_train.values
+        else:
+            X_train_array = np.array(X_train)
+        
+        if isinstance(y_train, pd.Series):
+            y_train_array = y_train.values
+        else:
+            y_train_array = np.array(y_train)
+        
+        class_counts = pd.Series(y_train_array).value_counts()
+        max_count = class_counts.max()
+        
+        X_augmented = [X_train_array]
+        y_augmented = [y_train_array]
+        
+        # 對每個少數類別進行增強
+        for class_label in class_counts.index:
+            count = class_counts[class_label]
+            if count < max_count * 0.5:  # 如果樣本數 < 最多類別的50%
+                # 計算需要增強的樣本數
+                n_samples_needed = int((max_count * augment_ratio - count))
+                if n_samples_needed > 0:
+                    # 從該類別中重新採樣並添加小噪聲
+                    class_mask = y_train_array == class_label
+                    X_class = X_train_array[class_mask]
+                    
+                    # 重採樣
+                    indices = np.random.choice(len(X_class), n_samples_needed, replace=True)
+                    X_resampled = X_class[indices]
+                    
+                    # 添加小噪聲（5%標準差）
+                    noise = np.random.normal(0, 0.05, X_resampled.shape)
+                    X_std = np.std(X_resampled, axis=0)
+                    X_resampled_noisy = X_resampled + noise * X_std
+                    
+                    y_resampled = np.array([class_label] * n_samples_needed)
+                    
+                    X_augmented.append(X_resampled_noisy)
+                    y_augmented.append(y_resampled)
+                    
+                    class_name = ['賣出/觀望', '持有', '買入'][int(class_label)]
+                    print(f"  為 '{class_name}' 類別生成 {n_samples_needed} 個增強樣本")
+        
+        # 合併所有數據
+        X_final = np.vstack(X_augmented)
+        y_final = np.concatenate(y_augmented)
+        
+        return X_final, y_final
+    
     def train(self, X_train, y_train):
-        """訓練模型"""
+        """訓練模型（支援 Few-Shot Learning）"""
         print(f"\n開始訓練 {self.stock_id} 的模型...")
-        self.model.fit(X_train, y_train)
+        
+        if self.use_few_shot:
+            print("\n=== Few-Shot Learning 模式 ===")
+            
+            # 1. 計算樣本權重
+            sample_weights = self.calculate_sample_weights(y_train)
+            
+            # 2. 數據增強
+            print("\n執行數據增強...")
+            X_train_aug, y_train_aug = self.augment_minority_samples(X_train, y_train)
+            print(f"增強後訓練集大小：{len(X_train_aug)} 筆 (原始: {len(X_train)} 筆)")
+            
+            # 3. 使用增強後的數據和樣本權重訓練
+            # 重新計算增強後數據的權重
+            sample_weights_aug = self.calculate_sample_weights(y_train_aug)
+            print("\n使用樣本權重訓練模型...")
+            self.model.fit(X_train_aug, y_train_aug, sample_weight=sample_weights_aug)
+        else:
+            print("\n=== 標準訓練模式 ===")
+            self.model.fit(X_train, y_train)
         
         # 顯示特徵重要性
         feature_importance = pd.DataFrame({
@@ -258,31 +393,18 @@ class StockTradingModel:
         
         return self.model
     
-    def evaluate(self, X_test, y_test, threshold=0.35):
-        """
-        評估模型
-        
-        Args:
-            X_test: 測試特徵
-            y_test: 測試標籤
-            threshold: 預測機率門檻 (預設 0.35，降低門檻以增加買入訊號)
-        
-        Returns:
-            tuple: (y_pred, y_pred_proba, accuracy)
-        """
-        # 使用自定義門檻進行預測
+    def evaluate(self, X_test, y_test):
+        """評估模型"""
+        y_pred = self.model.predict(X_test)
         y_pred_proba = self.model.predict_proba(X_test)[:, 1]
-        y_pred = (y_pred_proba >= threshold).astype(int)  # ★ 使用自定義門檻
         
         accuracy = accuracy_score(y_test, y_pred)
         
         print(f"\n模型評估結果 - {self.stock_id}")
         print("="*50)
         print(f"準確率 (Accuracy): {accuracy:.4f}")
-        print(f"預測門檻 (Threshold): {threshold}")
-        print(f"預測買入次數: {y_pred.sum()} / {len(y_pred)} ({y_pred.mean():.2%})")
         print("\n分類報告:")
-        print(classification_report(y_test, y_pred, target_names=['看跌/觀望', '看漲/買入']))
+        print(classification_report(y_test, y_pred, target_names=['賣出/觀望', '持有', '買入']))
         print("\n混淆矩陣:")
         print(confusion_matrix(y_test, y_pred))
         
@@ -333,6 +455,204 @@ class Backtester:
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
+    
+    def backtest_portfolio(self, stocks_data, stocks_predictions, allocation_strategy='equal'):
+        """
+        執行多股票投資組合回測
+        
+        Args:
+            stocks_data: dict, {stock_id: test_data}
+            stocks_predictions: dict, {stock_id: predictions}
+            allocation_strategy: 資金配置策略 ('equal'=平均分配, 'dynamic'=動態配置)
+        
+        Returns:
+            dict: 回測結果統計
+        """
+        # 確保所有股票的日期索引一致
+        all_dates = None
+        for stock_id, data in stocks_data.items():
+            if all_dates is None:
+                all_dates = data.index
+            else:
+                all_dates = all_dates.intersection(data.index)
+        
+        # 初始化
+        capital = self.initial_capital
+        positions = {stock_id: 0 for stock_id in stocks_data.keys()}  # 各股持倉
+        trades = []  # 交易記錄
+        portfolio_values = []  # 投資組合價值
+        
+        for i in range(len(all_dates) - 1):
+            current_date = all_dates[i]
+            
+            # 計算當前投資組合價值
+            current_value = capital
+            for stock_id, position in positions.items():
+                if position > 0:
+                    current_price = stocks_data[stock_id].loc[current_date, 'Close']
+                    current_value += position * current_price * (1 - self.commission_rate)
+            
+            portfolio_values.append({
+                'Date': current_date,
+                'Value': current_value
+            })
+            
+            # 獲取下一個交易日的資訊
+            next_date = all_dates[i + 1]
+            
+            # 收集所有股票的訊號
+            signals = {}
+            for stock_id in stocks_data.keys():
+                pred_idx = list(stocks_data[stock_id].index).index(current_date)
+                prediction = stocks_predictions[stock_id][pred_idx]
+                next_open = stocks_data[stock_id].loc[next_date, 'Open']
+                signals[stock_id] = {
+                    'prediction': prediction,
+                    'next_open': next_open
+                }
+            
+            # 決定交易策略
+            if allocation_strategy == 'equal':
+                # 平均分配策略：將資金平均分配給所有買入訊號的股票
+                buy_signals = [sid for sid, sig in signals.items() if sig['prediction'] == 2 and positions[sid] == 0]
+                sell_signals = [sid for sid, sig in signals.items() if sig['prediction'] == 0 and positions[sid] > 0]
+                
+                # 先賣出
+                for stock_id in sell_signals:
+                    if positions[stock_id] > 0:
+                        next_open = signals[stock_id]['next_open']
+                        revenue = positions[stock_id] * next_open * (1 - self.commission_rate)
+                        capital += revenue
+                        trades.append({
+                            'Date': next_date,
+                            'Stock': stock_id,
+                            'Type': 'SELL',
+                            'Price': next_open,
+                            'Shares': positions[stock_id],
+                            'Capital': capital
+                        })
+                        positions[stock_id] = 0
+                
+                # 再買入
+                if buy_signals:
+                    # 將可用資金平均分配
+                    capital_per_stock = capital / len(buy_signals)
+                    for stock_id in buy_signals:
+                        next_open = signals[stock_id]['next_open']
+                        shares = int(capital_per_stock / next_open)
+                        if shares > 0:
+                            cost = shares * next_open * (1 + self.commission_rate)
+                            if cost <= capital:
+                                capital -= cost
+                                positions[stock_id] = shares
+                                trades.append({
+                                    'Date': next_date,
+                                    'Stock': stock_id,
+                                    'Type': 'BUY',
+                                    'Price': next_open,
+                                    'Shares': shares,
+                                    'Capital': capital
+                                })
+        
+        # 最後清算所有持倉
+        final_date = all_dates[-1]
+        for stock_id, position in positions.items():
+            if position > 0:
+                final_close = stocks_data[stock_id].loc[final_date, 'Close']
+                capital += position * final_close * (1 - self.commission_rate)
+                trades.append({
+                    'Date': final_date,
+                    'Stock': stock_id,
+                    'Type': 'SELL',
+                    'Price': final_close,
+                    'Shares': position,
+                    'Capital': capital
+                })
+        
+        # 計算績效指標
+        final_value = capital
+        total_return = (final_value - self.initial_capital) / self.initial_capital
+        
+        # 計算最大回撤
+        portfolio_df = pd.DataFrame(portfolio_values)
+        portfolio_df['Peak'] = portfolio_df['Value'].cummax()
+        portfolio_df['Drawdown'] = (portfolio_df['Value'] - portfolio_df['Peak']) / portfolio_df['Peak']
+        max_drawdown = portfolio_df['Drawdown'].min()
+        
+        # 計算年化報酬
+        days = (all_dates[-1] - all_dates[0]).days
+        years = days / 365.25
+        annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+        
+        results = {
+            'initial_capital': self.initial_capital,
+            'final_value': final_value,
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'max_drawdown': max_drawdown,
+            'num_trades': len(trades),
+            'trades': trades,
+            'portfolio_values': portfolio_df
+        }
+        
+        return results
+    
+    def print_detailed_trades(self, trades, stocks_names=None):
+        """
+        詳細印出所有交易記錄，包括交易後的持倉狀態
+        
+        Args:
+            trades: 交易記錄列表
+            stocks_names: 股票名稱字典 {stock_id: stock_name}
+        """
+        if not trades:
+            print("\n沒有交易記錄")
+            return
+        
+        print("\n" + "="*120)
+        print("詳細交易記錄與持倉狀態")
+        print("="*120)
+        print(f"{'序號':<5} {'日期':<12} {'股票':<18} {'動作':<8} {'價格':<10} {'股數':<8} {'交易金額':<13} {'剩餘現金':<13} {'當前持倉':<30}")
+        print("-"*120)
+        
+        # 追蹤當前持倉狀態
+        current_positions = {}
+        
+        for idx, trade in enumerate(trades, 1):
+            date_str = trade['Date'].strftime('%Y-%m-%d')
+            stock_id = trade['Stock']
+            stock_name = stocks_names.get(stock_id, stock_id) if stocks_names else stock_id
+            trade_type = trade['Type']
+            price = trade['Price']
+            shares = trade['Shares']
+            capital = trade['Capital']
+            
+            # 計算交易金額
+            if trade_type == 'BUY':
+                amount = shares * price * (1 + self.commission_rate)
+                action_symbol = '買入 ↑'
+                current_positions[stock_id] = current_positions.get(stock_id, 0) + shares
+            else:
+                amount = shares * price * (1 - self.commission_rate)
+                action_symbol = '賣出 ↓'
+                current_positions[stock_id] = current_positions.get(stock_id, 0) - shares
+                if current_positions[stock_id] == 0:
+                    del current_positions[stock_id]
+            
+            # 顯示股票名稱
+            display_name = f"{stock_name[:6]}({stock_id[:7]})"
+            
+            # 顯示當前持倉
+            if current_positions:
+                positions_str = ", ".join([f"{sid[:7]}:{shares}股" for sid, shares in current_positions.items()])
+            else:
+                positions_str = "空倉"
+            
+            print(f"{idx:<5} {date_str:<12} {display_name:<18} {action_symbol:<8} ${price:>8.2f} {shares:>7} ${amount:>11,.0f} ${capital:>11,.0f} {positions_str:<30}")
+        
+        print("="*120)
+        print(f"總計 {len(trades)} 筆交易")
+        print("="*120)
         
     def backtest(self, test_data, predictions):
         """
@@ -359,8 +679,8 @@ class Backtester:
             next_open = df.iloc[i + 1]['Open']
             current_prediction = df.iloc[i]['Prediction']
             
-            # 根據預測訊號決定交易
-            if current_prediction == 1 and position == 0:
+            # 根據預測訊號決定交易（0=賣出, 1=持有, 2=買入）
+            if current_prediction == 2 and position == 0:
                 # 買入訊號：用所有資金買入
                 shares = int(capital / next_open)
                 if shares > 0:
@@ -387,6 +707,8 @@ class Backtester:
                     'Capital': capital
                 })
                 position = 0
+            
+            # 當 current_prediction == 1 時，保持持有狀態（不做任何動作）
             
             # 計算當前投資組合價值
             current_value = capital
@@ -533,11 +855,13 @@ def daily_inference(stock_id, model_path):
     probabilities = model.model.predict_proba(latest_features)[0]
     
     # 6. 輸出結果
+    action_map = {0: '賣出/觀望', 1: '持有', 2: '買入'}
     print(f"\n最新資料日期：{latest_date.date()}")
     print(f"收盤價：${latest_close:.2f}")
-    print(f"\n預測結果：{'看漲 (建議買入)' if prediction == 1 else '看跌/盤整 (建議觀望)'}")
-    print(f"看漲機率：{probabilities[1]:.2%}")
-    print(f"看跌機率：{probabilities[0]:.2%}")
+    print(f"\n預測結果：{action_map[prediction]} (建議操作)")
+    print(f"買入機率：{probabilities[2]:.2%}")
+    print(f"持有機率：{probabilities[1]:.2%}")
+    print(f"賣出/觀望機率：{probabilities[0]:.2%}")
     
     # 7. 顯示關鍵技術指標
     print(f"\n關鍵技術指標：")
@@ -546,13 +870,14 @@ def daily_inference(stock_id, model_path):
     print(f"  ATR標準化：{df.iloc[-1]['ATR_Normalized']:.4f}")
     print(f"  5日對數收益：{df.iloc[-1]['LogReturn_5']:.4f}")
     
+    signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
     result = {
         'stock_id': stock_id,
         'date': latest_date,
         'close_price': latest_close,
         'prediction': prediction,
         'probabilities': probabilities,
-        'signal': 'BUY' if prediction == 1 else 'HOLD'
+        'signal': signal_map[prediction]
     }
     
     print(f"\n{'='*70}\n")
@@ -566,7 +891,7 @@ def main():
     """主程式：執行完整的訓練與回測流程"""
     
     print("="*70)
-    print("AI 金融交易系統 - 台股 MVP 專案")
+    print("AI 金融交易系統 - 台股 MVP 專案 (投資組合模式)")
     print("="*70)
     
     # 定義標的股票
@@ -578,13 +903,20 @@ def main():
     
     benchmark = '0050.TW'  # 基準指數
     
-    # 儲存所有結果
-    all_results = {}
+    # 儲存所有模型和預測結果
+    all_models = {}
+    all_test_data = {}
+    all_predictions = {}
+    all_accuracies = {}
     
     # 取得腳本所在目錄
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # 對每支股票執行訓練與回測
+    # 第一階段：訓練/載入所有股票的模型
+    print("\n" + "="*70)
+    print("第一階段：訓練/載入模型")
+    print("="*70)
+    
     for stock_id, stock_name in stocks.items():
         print(f"\n\n{'#'*70}")
         print(f"處理股票：{stock_name} ({stock_id})")
@@ -604,7 +936,7 @@ def main():
                 # 下載資料用於回測
                 data = download_stock_data(stock_id)
                 df = engineer_features(data)
-                df['Target'] = create_labels(df, threshold=0.002)  # 使用新門檻
+                df['Target'] = create_labels(df, threshold=0.004, hold_threshold=0.002)
                 df = df.dropna()
                 test_data = df.loc['2024-01-01':]
                 
@@ -634,30 +966,57 @@ def main():
                 # 6. 儲存模型
                 model.save_model(model_filename)
             
-            # 7. 回測
-            backtester = Backtester(initial_capital=1000000)
-            backtest_results = backtester.backtest(test_data, y_pred)
-            buy_hold_results = backtester.calculate_buy_and_hold(test_data)
-            
-            # 8. 顯示結果
-            backtester.print_results(backtest_results, buy_hold_results)
-            
             # 儲存結果
-            all_results[stock_id] = {
-                'stock_name': stock_name,
-                'accuracy': accuracy,
-                'backtest': backtest_results,
-                'buy_hold': buy_hold_results,
-                'model_path': model_path
-            }
+            all_models[stock_id] = model
+            all_test_data[stock_id] = test_data
+            all_predictions[stock_id] = y_pred
+            all_accuracies[stock_id] = accuracy
             
         except Exception as e:
             print(f"錯誤：處理 {stock_id} 時發生異常：{str(e)}")
             continue
     
-    # 下載並比較 0050
+    # 第二階段：使用投資組合策略回測（共用100萬資金）
+    print("\n\n" + "="*70)
+    print("第二階段：投資組合回測（三檔股票共用100萬資金）")
+    print("="*70)
+    
+    if len(all_test_data) == len(stocks):
+        backtester = Backtester(initial_capital=1000000)
+        portfolio_results = backtester.backtest_portfolio(all_test_data, all_predictions)
+        
+        print("\n投資組合回測結果：")
+        print("="*70)
+        print(f"初始資金：${portfolio_results['initial_capital']:,.0f}")
+        print(f"最終資金：${portfolio_results['final_value']:,.0f}")
+        print(f"總報酬率：{portfolio_results['total_return']:.2%}")
+        print(f"年化報酬：{portfolio_results['annual_return']:.2%}")
+        print(f"最大回撤：{portfolio_results['max_drawdown']:.2%}")
+        print(f"總交易次數：{portfolio_results['num_trades']}")
+        
+        # 統計各股票的交易次數
+        trade_counts = {}
+        for trade in portfolio_results['trades']:
+            stock = trade['Stock']
+            trade_counts[stock] = trade_counts.get(stock, 0) + 1
+        
+        print("\n各股票交易次數：")
+        for stock_id, count in trade_counts.items():
+            stock_name = stocks[stock_id]
+            print(f"  {stock_name} ({stock_id}): {count} 次")
+        
+        print("="*70)
+        
+        # 顯示詳細交易記錄
+        if portfolio_results['num_trades'] > 0:
+            backtester.print_detailed_trades(portfolio_results['trades'], stocks)
+    else:
+        print("\n警告：部分股票模型未能成功載入，無法執行投資組合回測")
+        portfolio_results = None
+    
+    # 第三階段：下載並比較 0050
     print(f"\n\n{'#'*70}")
-    print(f"下載基準指數：0050.TW")
+    print(f"比較基準指數：0050.TW")
     print(f"{'#'*70}")
     
     try:
@@ -677,33 +1036,42 @@ def main():
         print(f"錯誤：處理 0050 時發生異常：{str(e)}")
         benchmark_0050 = None
     
-    # 總結比較
+    # 最終總結
     print("\n\n" + "="*70)
-    print("總結：各股票策略績效比較")
+    print("最終績效總結")
     print("="*70)
-    print(f"{'股票代碼':<12} {'股票名稱':<15} {'模型準確率':<12} {'AI策略報酬':<12} {'買入持有報酬':<12} {'超額報酬':<10}")
+    
+    print("\n【各股票模型準確率】")
     print("-"*70)
+    for stock_id, accuracy in all_accuracies.items():
+        stock_name = stocks[stock_id]
+        print(f"{stock_name:<20} ({stock_id}): {accuracy:.2%}")
     
-    for stock_id, results in all_results.items():
-        stock_name = results['stock_name']
-        accuracy = results['accuracy']
-        ai_return = results['backtest']['total_return']
-        bh_return = results['buy_hold']['total_return']
-        excess_return = ai_return - bh_return
-        
-        print(f"{stock_id:<12} {stock_name:<15} {accuracy:>10.2%}  {ai_return:>10.2%}  {bh_return:>10.2%}  {excess_return:>10.2%}")
-    
-    if benchmark_0050:
+    if portfolio_results:
+        print("\n【投資組合策略 vs 基準指數】")
         print("-"*70)
-        print(f"{'0050.TW':<12} {'元大台灣50':<15} {'N/A':>10}  {'N/A':>10}  {benchmark_0050['total_return']:>10.2%}  {'N/A':>10}")
+        print(f"{'策略':<30} {'總報酬率':<15} {'年化報酬':<15} {'最大回撤':<15}")
+        print("-"*70)
+        print(f"{'AI投資組合 (三檔共100萬)':<30} {portfolio_results['total_return']:>12.2%}  {portfolio_results['annual_return']:>12.2%}  {portfolio_results['max_drawdown']:>12.2%}")
+        
+        if benchmark_0050:
+            print(f"{'0050買入持有 (100萬)':<30} {benchmark_0050['total_return']:>12.2%}  {benchmark_0050['annual_return']:>12.2%}  {'N/A':>12}")
+            excess = portfolio_results['total_return'] - benchmark_0050['total_return']
+            print("-"*70)
+            print(f"{'超額報酬':<30} {excess:>12.2%}")
     
     print("="*70)
     
     print("\n專案執行完成！")
+    print("投資組合模式：使用100萬資金同時操作三檔股票")
     print("您可以使用 daily_inference() 函數進行每日推論")
     print("範例：daily_inference('2330.TW', 'model_2330.pkl')")
     
-    return all_results
+    return {
+        'portfolio_results': portfolio_results,
+        'accuracies': all_accuracies,
+        'benchmark_0050': benchmark_0050
+    }
 
 
 if __name__ == "__main__":
