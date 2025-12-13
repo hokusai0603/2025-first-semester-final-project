@@ -688,7 +688,7 @@ class StockTradingModel:
 class Backtester:
     """回測系統"""
     
-    def __init__(self, initial_capital=1000000, commission_rate=0.002):
+    def __init__(self, initial_capital=1000000, commission_rate=0.002, verbose=True):
         """
         Args:
             initial_capital: 初始資金 (預設100萬)
@@ -696,8 +696,9 @@ class Backtester:
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
+        self.verbose = verbose
     
-    def backtest_portfolio(self, stocks_data, stocks_predictions, allocation_strategy='equal'):
+    def backtest_portfolio(self, stocks_data, stocks_predictions, allocation_strategy='equal', stocks_pred_proba=None):
         """
         執行多股票投資組合回測
         
@@ -747,9 +748,26 @@ class Backtester:
                 pred_idx = list(stocks_data[stock_id].index).index(current_date)
                 prediction = stocks_predictions[stock_id][pred_idx]
                 next_open = stocks_data[stock_id].loc[next_date, 'Open']
+                # 取出機率（若提供）
+                proba = None
+                if stocks_pred_proba and stock_id in stocks_pred_proba:
+                    try:
+                        proba = stocks_pred_proba[stock_id][pred_idx]
+                    except Exception:
+                        proba = None
+                # 擷取目前的關鍵特徵作為判斷依據（若存在）
+                feature_snapshot = {}
+                for col in ['RSI', 'SMA_Deviation', 'ATR_Normalized', 'LogReturn_5', 'LogReturn_10', 'LogReturn_20', 'Momentum_10', 'Momentum_20', 'Volume_Change']:
+                    if col in stocks_data[stock_id].columns:
+                        try:
+                            feature_snapshot[col] = float(stocks_data[stock_id].loc[current_date, col])
+                        except Exception:
+                            pass
                 signals[stock_id] = {
                     'prediction': prediction,
                     'next_open': next_open
+                    , 'proba': proba
+                    , 'features': feature_snapshot
                 }
             
             # 決定交易策略
@@ -764,13 +782,29 @@ class Backtester:
                         next_open = signals[stock_id]['next_open']
                         revenue = positions[stock_id] * next_open * (1 - self.commission_rate)
                         capital += revenue
+                        # 日誌：輸出判斷依據
+                        if self.verbose:
+                            msg = f"[SELL] {next_date.date()} {stock_id} 價:{next_open:.2f} 股:{positions[stock_id]} 現金:{capital:,.0f}"
+                            p = signals[stock_id].get('proba')
+                            if p is not None:
+                                msg += f" | 機率(買/持/賣)={p[2]:.2%}/{p[1]:.2%}/{p[0]:.2%}"
+                            fs = signals[stock_id].get('features')
+                            if fs:
+                                # 精簡顯示重點特徵
+                                msg += f" | RSI:{fs.get('RSI'):.2f} 乖離:{fs.get('SMA_Deviation'):.2%} ATRn:{fs.get('ATR_Normalized'):.4f}"
+                            print(msg)
                         trades.append({
                             'Date': next_date,
                             'Stock': stock_id,
                             'Type': 'SELL',
                             'Price': next_open,
                             'Shares': positions[stock_id],
-                            'Capital': capital
+                            'Capital': capital,
+                            'Judgement': {
+                                'prediction': 0,
+                                'proba': signals[stock_id].get('proba'),
+                                'features': signals[stock_id].get('features')
+                            }
                         })
                         positions[stock_id] = 0
                 
@@ -786,13 +820,28 @@ class Backtester:
                             if cost <= capital:
                                 capital -= cost
                                 positions[stock_id] = shares
+                                # 日誌：輸出判斷依據
+                                if self.verbose:
+                                    msg = f"[BUY ] {next_date.date()} {stock_id} 價:{next_open:.2f} 股:{shares} 現金:{capital:,.0f}"
+                                    p = signals[stock_id].get('proba')
+                                    if p is not None:
+                                        msg += f" | 機率(買/持/賣)={p[2]:.2%}/{p[1]:.2%}/{p[0]:.2%}"
+                                    fs = signals[stock_id].get('features')
+                                    if fs:
+                                        msg += f" | RSI:{fs.get('RSI'):.2f} 乖離:{fs.get('SMA_Deviation'):.2%} ATRn:{fs.get('ATR_Normalized'):.4f}"
+                                    print(msg)
                                 trades.append({
                                     'Date': next_date,
                                     'Stock': stock_id,
                                     'Type': 'BUY',
                                     'Price': next_open,
                                     'Shares': shares,
-                                    'Capital': capital
+                                    'Capital': capital,
+                                    'Judgement': {
+                                        'prediction': 2,
+                                        'proba': signals[stock_id].get('proba'),
+                                        'features': signals[stock_id].get('features')
+                                    }
                                 })
         
         # 最後清算所有持倉
@@ -889,13 +938,38 @@ class Backtester:
             else:
                 positions_str = "空倉"
             
-            print(f"{idx:<5} {date_str:<12} {display_name:<18} {action_symbol:<8} ${price:>8.2f} {shares:>7} ${amount:>11,.0f} ${capital:>11,.0f} {positions_str:<30}")
+            base = f"{idx:<5} {date_str:<12} {display_name:<18} {action_symbol:<8} ${price:>8.2f} {shares:>7} ${amount:>11,.0f} ${capital:>11,.0f} {positions_str:<30}"
+            # 若有判斷依據，精簡附註
+            jud = trade.get('Judgement')
+            if jud and self.verbose:
+                p = jud.get('proba')
+                fs = jud.get('features') or {}
+                note = []
+                if p is not None:
+                    note.append(f"機率(買/持/賣)={p[2]:.2%}/{p[1]:.2%}/{p[0]:.2%}")
+                # 只擷取重點特徵
+                if fs:
+                    try:
+                        note.append(f"RSI:{float(fs.get('RSI')):.2f}")
+                    except Exception:
+                        pass
+                    try:
+                        note.append(f"乖離:{float(fs.get('SMA_Deviation')):.2%}")
+                    except Exception:
+                        pass
+                    try:
+                        note.append(f"ATRn:{float(fs.get('ATR_Normalized')):.4f}")
+                    except Exception:
+                        pass
+                if note:
+                    base += " \n      (" + "; ".join(note) + ")"
+            print(base)
         
         print("="*120)
         print(f"總計 {len(trades)} 筆交易")
         print("="*120)
         
-    def backtest(self, test_data, predictions):
+    def backtest(self, test_data, predictions, predictions_proba=None):
         """
         執行回測
         
@@ -919,6 +993,12 @@ class Backtester:
             current_date = df.index[i]
             next_open = df.iloc[i + 1]['Open']
             current_prediction = df.iloc[i]['Prediction']
+            current_proba = None
+            if predictions_proba is not None:
+                try:
+                    current_proba = predictions_proba[i]
+                except Exception:
+                    current_proba = None
             
             # 根據預測訊號決定交易（0=賣出, 1=持有, 2=買入）
             if current_prediction == 2 and position == 0:
@@ -928,24 +1008,52 @@ class Backtester:
                     cost = shares * next_open * (1 + self.commission_rate)
                     capital -= cost
                     position = shares
+                    # 輸出判斷依據日誌
+                    if self.verbose:
+                        msg = f"[BUY ] {df.index[i + 1].date()} 價:{next_open:.2f} 股:{shares} 現金:{capital:,.0f}"
+                        if current_proba is not None:
+                            msg += f" | 機率(買/持/賣)={current_proba[2]:.2%}/{current_proba[1]:.2%}/{current_proba[0]:.2%}"
+                        # 精簡特徵
+                        fs = {k: float(df.iloc[i].get(k)) for k in ['RSI','SMA_Deviation','ATR_Normalized'] if k in df.columns}
+                        if fs:
+                            msg += f" | RSI:{fs.get('RSI'):.2f} 乖離:{fs.get('SMA_Deviation'):.2%} ATRn:{fs.get('ATR_Normalized'):.4f}"
+                        print(msg)
                     trades.append({
                         'Date': df.index[i + 1],
                         'Type': 'BUY',
                         'Price': next_open,
                         'Shares': shares,
-                        'Capital': capital
+                        'Capital': capital,
+                        'Judgement': {
+                            'prediction': 2,
+                            'proba': current_proba,
+                            'features': {k: float(df.iloc[i].get(k)) for k in ['RSI','SMA_Deviation','ATR_Normalized','LogReturn_5','LogReturn_10','LogReturn_20','Momentum_10','Momentum_20','Volume_Change'] if k in df.columns}
+                        }
                     })
             
             elif current_prediction == 0 and position > 0:
                 # 賣出訊號：清倉
                 revenue = position * next_open * (1 - self.commission_rate)
                 capital += revenue
+                if self.verbose:
+                    msg = f"[SELL] {df.index[i + 1].date()} 價:{next_open:.2f} 股:{position} 現金:{capital:,.0f}"
+                    if current_proba is not None:
+                        msg += f" | 機率(買/持/賣)={current_proba[2]:.2%}/{current_proba[1]:.2%}/{current_proba[0]:.2%}"
+                    fs = {k: float(df.iloc[i].get(k)) for k in ['RSI','SMA_Deviation','ATR_Normalized'] if k in df.columns}
+                    if fs:
+                        msg += f" | RSI:{fs.get('RSI'):.2f} 乖離:{fs.get('SMA_Deviation'):.2%} ATRn:{fs.get('ATR_Normalized'):.4f}"
+                    print(msg)
                 trades.append({
                     'Date': df.index[i + 1],
                     'Type': 'SELL',
                     'Price': next_open,
                     'Shares': position,
-                    'Capital': capital
+                    'Capital': capital,
+                    'Judgement': {
+                        'prediction': 0,
+                        'proba': current_proba,
+                        'features': {k: float(df.iloc[i].get(k)) for k in ['RSI','SMA_Deviation','ATR_Normalized','LogReturn_5','LogReturn_10','LogReturn_20','Momentum_10','Momentum_20','Volume_Change'] if k in df.columns}
+                    }
                 })
                 position = 0
             
@@ -1148,6 +1256,7 @@ def main():
     all_models = {}
     all_test_data = {}
     all_predictions = {}
+    all_predictions_proba = {}
     all_accuracies = {}
     
     # 取得腳本所在目錄
@@ -1212,6 +1321,7 @@ def main():
             all_test_data[stock_id] = test_data
             all_predictions[stock_id] = y_pred
             all_accuracies[stock_id] = accuracy
+            all_predictions_proba[stock_id] = y_pred_proba
             
         except Exception as e:
             print(f"錯誤：處理 {stock_id} 時發生異常：{str(e)}")
@@ -1223,8 +1333,8 @@ def main():
     print("="*70)
     
     if len(all_test_data) == len(stocks):
-        backtester = Backtester(initial_capital=1000000)
-        portfolio_results = backtester.backtest_portfolio(all_test_data, all_predictions)
+        backtester = Backtester(initial_capital=1000000, verbose=True)
+        portfolio_results = backtester.backtest_portfolio(all_test_data, all_predictions, stocks_pred_proba=all_predictions_proba)
         
         print("\n投資組合回測結果：")
         print("="*70)
